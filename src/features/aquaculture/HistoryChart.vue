@@ -1,21 +1,73 @@
 <script setup lang="ts">
-import { computed } from "vue";
-import { getHistory, getMetric } from "./data";
-import type { MetricKey, Pool } from "./data";
+import { computed, onBeforeUnmount, ref, watch } from "vue";
+import { DATA_SOURCE, getPoolHistory } from "./api";
+import { getMetric } from "./data";
+import type { HistoryPoint, MetricKey, Pool } from "./data";
 
 const props = defineProps<{
   pool: Pool;
   metricKey: MetricKey;
   hours: number;
   now: number;
+  refreshKey?: number;
 }>();
 
 const metric = computed(() => getMetric(props.metricKey));
-const points = computed(() =>
-  getHistory(props.pool, props.metricKey, props.hours, props.now),
+const points = ref<HistoryPoint[]>([]);
+const loading = ref(false);
+const error = ref("");
+let requestId = 0;
+let controller: AbortController | undefined;
+
+async function loadHistory() {
+  const currentRequest = ++requestId;
+  controller?.abort();
+  controller = new AbortController();
+  const signal = controller.signal;
+  loading.value = true;
+  error.value = "";
+  points.value = [];
+
+  try {
+    const result = await getPoolHistory(
+      props.pool,
+      props.metricKey,
+      props.hours,
+      props.now,
+      signal,
+    );
+    if (currentRequest === requestId && !signal.aborted) points.value = result;
+  } catch (cause) {
+    if (currentRequest !== requestId || signal.aborted) return;
+    error.value = cause instanceof Error ? cause.message : "请检查网络和后端服务后重试";
+  } finally {
+    if (currentRequest === requestId) loading.value = false;
+  }
+}
+
+// The clock moves the chart's time axis; only selection or snapshot changes fetch data.
+watch(
+  [
+    () => props.pool.id,
+    () => props.metricKey,
+    () => props.hours,
+    () => props.refreshKey,
+    () => props.pool.measuredAt,
+  ],
+  loadHistory,
+  { immediate: true },
 );
+
+onBeforeUnmount(() => {
+  requestId += 1;
+  controller?.abort();
+});
+
 const hasMeasurements = computed(() =>
   points.value.some((point) => point.value !== null),
+);
+const chartLabel = computed(() =>
+  `${props.pool.id}号池近${props.hours}小时${metric.value.label}历史曲线，单位${metric.value.unit || '无量纲'}，${DATA_SOURCE === 'demo' ? '模拟数据' : '接口数据'}`,
 );
 
 const timeFormat = new Intl.DateTimeFormat("zh-CN", {
@@ -147,10 +199,20 @@ const option = computed(() => {
     :data-metric="metricKey"
     :data-hours="hours"
     :data-pool="pool.id"
-    role="img"
-    :aria-label="`${pool.id}号池近${hours}小时${metric.label}历史曲线，单位${metric.unit || '无量纲'}，模拟数据`"
+    :data-source="DATA_SOURCE"
+    :aria-busy="loading"
+    role="group"
+    :aria-label="chartLabel"
   >
-    <v-chart v-if="hasMeasurements" class="history-canvas" :option="option" autoresize />
+    <div v-if="loading" class="history-empty" data-testid="history-loading" role="status">
+      <strong>正在加载历史数据…</strong>
+    </div>
+    <div v-else-if="error" class="history-empty" data-testid="history-error" role="alert">
+      <strong>历史数据加载失败</strong>
+      <span class="history-error-detail">{{ error }}</span>
+      <button class="history-retry" type="button" @click="loadHistory">重新加载历史数据</button>
+    </div>
+    <v-chart v-else-if="hasMeasurements" class="history-canvas" :option="option" role="img" :aria-label="chartLabel" autoresize />
     <div v-else class="history-empty" data-testid="history-empty">
       <svg viewBox="0 0 48 36" aria-hidden="true">
         <path d="M3 3v29h42M8 25l9-8 8 4 8-11 9 4" />
@@ -206,6 +268,29 @@ const option = computed(() => {
 
   span {
     font-size: 11px;
+  }
+}
+
+.history-error-detail {
+  max-width: 88%;
+  text-align: center;
+  overflow-wrap: anywhere;
+}
+
+.history-retry {
+  padding: 5px 10px;
+  border: 1px solid #37617e;
+  border-radius: 3px;
+  background: rgba(24, 65, 91, .45);
+  color: #b9deef;
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+
+  &:hover,
+  &:focus-visible {
+    border-color: #62c9ed;
+    background: rgba(36, 92, 124, .6);
   }
 }
 </style>

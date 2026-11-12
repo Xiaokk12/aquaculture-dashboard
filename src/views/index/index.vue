@@ -5,20 +5,27 @@ import { WORKSHOPS, getWorkshop, DEFAULT_WORKSHOP_ID } from "@/features/aquacult
 import ItemWrap from "@/components/item-wrap";
 import PoolMap from "@/features/aquaculture/PoolMap.vue";
 import HistoryChart from "@/features/aquaculture/HistoryChart.vue";
-import { METRICS, createDemoSnapshot, formatMetric, getAlerts, getMetric, getPoolStatus } from "@/features/aquaculture/data";
-import type { Alert, MetricKey, Pool, PoolStatus } from "@/features/aquaculture/data";
+import { METRICS, formatMetric, getAlerts, getMetric, getPoolStatus } from "@/features/aquaculture/data";
+import { DATA_SOURCE, getWorkshopSnapshot } from "@/features/aquaculture/api";
+import type { Alert, DemoSnapshot, MetricKey, Pool, PoolStatus } from "@/features/aquaculture/data";
 
 const route = useRoute();
 const router = useRouter();
 const initialWorkshopId = typeof route.query.workshop === "string" && WORKSHOPS.some(item => item.id === route.query.workshop) ? route.query.workshop : DEFAULT_WORKSHOP_ID;
 const activeWorkshopId = ref(initialWorkshopId);
 const workshop = computed(() => getWorkshop(activeWorkshopId.value));
-const snapshot = ref(createDemoSnapshot(Date.now(), initialWorkshopId));
-const deviceAllocation = computed(() => snapshot.value.devices.map(device => `${device.id} ${device.poolIds.length} 池`).join(" · "));
-const searchExample = computed(() => `${snapshot.value.devices[0].id}-08`);
+const snapshot = ref<DemoSnapshot | null>(null);
+const loading = ref(false);
+const loadError = ref("");
+const lastLoadedAt = ref<number | null>(null);
+let snapshotController: AbortController | undefined;
+let snapshotRequest = 0;
+let refreshTimer: ReturnType<typeof setInterval>;
+const deviceAllocation = computed(() => (snapshot.value?.devices ?? []).map(device => `${device.id} ${device.poolIds.length} 池`).join(" · "));
+const searchExample = computed(() => `${workshop.value.devices[0].id}-08`);
 const now = ref(Date.now());
-const selectedPoolId = ref(snapshot.value.pools[0].id);
-const selectedDeviceId = ref(snapshot.value.devices[0].id);
+const selectedPoolId = ref("");
+const selectedDeviceId = ref("");
 const selectionMode = ref<"pool" | "device">("pool");
 const activeMetric = ref<MetricKey>("oxygen");
 const mapMetric = ref<MetricKey | "status">("status");
@@ -31,22 +38,22 @@ const statusNames: Record<PoolStatus, string> = { normal: "水质正常", warnin
 const statusColors: Record<PoolStatus, string> = { normal: "#43cdb4", warning: "#ffb565", stale: "#91a8bc", empty: "#6e8ca8" };
 const states: PoolStatus[] = ["normal", "warning", "stale", "empty"];
 
-const selectedPool = computed(() => snapshot.value.pools.find(pool => pool.id === selectedPoolId.value)!);
-const selectedDevice = computed(() => snapshot.value.devices.find(device => device.id === selectedDeviceId.value)!);
+const selectedPool = computed(() => snapshot.value?.pools.find(pool => pool.id === selectedPoolId.value)!);
+const selectedDevice = computed(() => snapshot.value?.devices.find(device => device.id === selectedDeviceId.value)!);
 const selectedStatus = computed(() => getPoolStatus(selectedPool.value, now.value));
-const groupPools = computed(() => snapshot.value.pools.filter(pool => pool.deviceId === selectedDeviceId.value));
+const groupPools = computed(() => (snapshot.value?.pools ?? []).filter(pool => pool.deviceId === selectedDeviceId.value));
 const statusCounts = computed(() => {
   const counts = { normal: 0, warning: 0, stale: 0, empty: 0 };
-  snapshot.value.pools.forEach(pool => { counts[getPoolStatus(pool, now.value)] += 1; });
+  snapshot.value?.pools.forEach(pool => { counts[getPoolStatus(pool, now.value)] += 1; });
   return counts;
 });
-const onlineCount = computed(() => snapshot.value.devices.filter(device => device.status === "online").length);
-const deviceSummaries = computed(() => snapshot.value.devices.map(device => {
+const onlineCount = computed(() => (snapshot.value?.devices ?? []).filter(device => device.status === "online").length);
+const deviceSummaries = computed(() => (snapshot.value?.devices ?? []).map(device => {
   const counts = { normal: 0, warning: 0, stale: 0, empty: 0 };
-  snapshot.value.pools.filter(pool => pool.deviceId === device.id).forEach(pool => { counts[getPoolStatus(pool, now.value)] += 1; });
+  (snapshot.value?.pools ?? []).filter(pool => pool.deviceId === device.id).forEach(pool => { counts[getPoolStatus(pool, now.value)] += 1; });
   return { ...device, counts };
 }));
-const alerts = computed(() => getAlerts(snapshot.value, now.value));
+const alerts = computed(() => snapshot.value ? getAlerts(snapshot.value, now.value) : []);
 const visibleAlerts = computed(() => alerts.value.filter(alert => alertFilter.value === "all" || (alertFilter.value === "water" ? alert.kind === "water" : alert.kind !== "water")));
 const selectedMetricDefinition = computed(() => getMetric(activeMetric.value));
 const selectedReadingIsOld = computed(() => selectedStatus.value === "stale");
@@ -60,7 +67,7 @@ function ageText(pool: Pool) {
   return minutes < 1 ? "刚刚采集" : minutes < 60 ? minutes + " 分钟前" : Math.floor(minutes / 60) + " 小时 " + (minutes % 60) + " 分钟前";
 }
 function selectPool(id: string) {
-  const pool = snapshot.value.pools.find(item => item.id === id);
+  const pool = snapshot.value?.pools.find(item => item.id === id);
   if (!pool) return;
   selectedPoolId.value = id;
   selectedDeviceId.value = pool.deviceId;
@@ -68,7 +75,7 @@ function selectPool(id: string) {
   searchNotice.value = "";
 }
 function selectDevice(id: string) {
-  const device = snapshot.value.devices.find(item => item.id === id);
+  const device = snapshot.value?.devices.find(item => item.id === id);
   if (!device) return;
   selectedDeviceId.value = id;
   selectedPoolId.value = device.poolIds.includes(selectedPoolId.value) ? selectedPoolId.value : device.poolIds[0];
@@ -86,12 +93,14 @@ function setMapMetric(key: MetricKey | "status") {
 }
 function applyWorkshop(id: string) {
   if (!WORKSHOPS.some(item => item.id === id)) return;
-  const generatedAt = Date.now();
+  snapshotController?.abort();
+  snapshotRequest += 1;
   activeWorkshopId.value = id;
-  snapshot.value = createDemoSnapshot(generatedAt, id);
-  now.value = generatedAt;
-  selectedPoolId.value = snapshot.value.pools[0].id;
-  selectedDeviceId.value = snapshot.value.devices[0].id;
+  snapshot.value = null;
+  lastLoadedAt.value = null;
+  loadError.value = "";
+  selectedPoolId.value = "";
+  selectedDeviceId.value = "";
   selectionMode.value = "pool";
   poolQuery.value = "";
   searchNotice.value = "";
@@ -109,19 +118,41 @@ watch(() => route.query.workshop, id => {
 function findPool() {
   const match = /^([A-Z]\d)[-－—\s]?(\d{1,2})$/.exec(poolQuery.value.trim().toUpperCase());
   const id = match ? `${match[1]}-${match[2].padStart(2, "0")}` : "";
-  const pool = snapshot.value.pools.find(item => item.id === id);
+  const pool = snapshot.value?.pools.find(item => item.id === id);
   if (pool) { selectPool(pool.id); searchNotice.value = "已定位 " + pool.id + " · " + selectedDevice.value.region; }
   else searchNotice.value = `当前车间未找到该池，请输入图中池号，如 ${searchExample.value}`;
 }
 function resetView() {
+  if (!snapshot.value) return;
   selectPool(snapshot.value.pools[0].id); mapMetric.value = "status"; poolQuery.value = "";
 }
-function refreshDemo() {
-  const refreshedAt = Date.now();
-  now.value = refreshedAt;
-  snapshot.value = createDemoSnapshot(refreshedAt, activeWorkshopId.value);
-  searchNotice.value = "演示数据已重新生成";
+async function refreshSnapshot() {
+  const requestId = ++snapshotRequest;
+  const workshopId = activeWorkshopId.value;
+  snapshotController?.abort();
+  const controller = new AbortController();
+  snapshotController = controller;
+  loading.value = true;
+  loadError.value = "";
+  try {
+    const result = await getWorkshopSnapshot(workshopId, controller.signal);
+    if (requestId !== snapshotRequest) return;
+    snapshot.value = result;
+    now.value = Date.now();
+    lastLoadedAt.value = now.value;
+    if (!result.pools.some(pool => pool.id === selectedPoolId.value)) {
+      selectedPoolId.value = result.pools[0].id;
+    }
+    const currentPool = result.pools.find(pool => pool.id === selectedPoolId.value)!;
+    selectedDeviceId.value = currentPool.deviceId;
+  } catch (error) {
+    if (requestId !== snapshotRequest || controller.signal.aborted) return;
+    loadError.value = error instanceof Error ? error.message : "数据请求失败";
+  } finally {
+    if (requestId === snapshotRequest) loading.value = false;
+  }
 }
+watch(activeWorkshopId, () => { void refreshSnapshot(); }, { immediate: true });
 function metricState(key: MetricKey) {
   const value = selectedPool.value.values[key];
   if (value === null || !Number.isFinite(value)) return "缺测";
@@ -129,8 +160,16 @@ function metricState(key: MetricKey) {
   const metric = getMetric(key);
   return value < metric.min || value > metric.max ? "超限" : "正常";
 }
-onMounted(() => { clockTimer = setInterval(() => { now.value = Date.now(); }, 15_000); });
-onUnmounted(() => clearInterval(clockTimer));
+onMounted(() => {
+  clockTimer = setInterval(() => { now.value = Date.now(); }, 15_000);
+  refreshTimer = setInterval(() => { if (!loading.value) void refreshSnapshot(); }, 30_000);
+});
+onUnmounted(() => {
+  snapshotRequest += 1;
+  snapshotController?.abort();
+  clearInterval(clockTimer);
+  clearInterval(refreshTimer);
+});
 </script>
 
 <template>
@@ -142,7 +181,13 @@ onUnmounted(() => clearInterval(clockTimer));
         <span class="workshop-nav-count">{{ item.poolCount }}<small>池</small></span>
       </button>
     </nav>
-    <div class="dashboard" :data-workshop="workshop.id">
+    <div class="data-status" :class="{ 'data-error': loadError }" :role="loadError ? 'alert' : 'status'" data-testid="snapshot-status" :aria-busy="loading">
+      <span v-if="loadError">{{ DATA_SOURCE === 'api' ? '接口读取失败' : '数据加载失败' }}：{{ loadError }}。{{ snapshot ? '当前保留上次成功快照，读数可能已过期。' : '暂未取得数据。' }}30 秒后自动重试。</span>
+      <span v-else-if="loading">{{ snapshot ? '正在刷新数据…' : '正在加载车间数据…' }}</span>
+      <span v-else>{{ DATA_SOURCE === 'demo' ? '模拟数据' : '后端接口' }} · 最近读取 {{ sampleTime(lastLoadedAt) }} · 每 30 秒自动刷新</span>
+      <button v-if="loadError" type="button" class="quiet-button" :disabled="loading" @click="refreshSnapshot">重试</button>
+    </div>
+    <div v-if="snapshot" class="dashboard" :data-workshop="workshop.id">
     <aside class="left-column">
       <ItemWrap class="panel overview-panel" title="养殖概况">
         <div class="overview-total"><div><span class="muted">当前车间养殖池</span><div class="total-number">{{ snapshot.pools.length }} <small>池</small></div></div><div class="overview-side"><strong>{{ snapshot.devices.length }} <small>台检测机</small></strong><span>按图纸分区配置</span></div></div>
@@ -178,7 +223,7 @@ onUnmounted(() => clearInterval(clockTimer));
 
     <section class="center-column">
       <ItemWrap class="panel map-panel" title="养殖池平面分布">
-        <div class="map-topbar"><div class="workshop-label"><span class="workshop-icon" aria-hidden="true">▤</span><div><strong>{{ workshop.title }}</strong><span>{{ workshop.poolCount }} 池 · {{ snapshot.devices.length }} 台检测机 · 图纸第 {{ workshop.drawingPage }} / 5 页</span></div></div><div class="map-actions"><button type="button" class="quiet-button" @click="resetView" data-testid="reset-view">回到总览</button><button type="button" class="quiet-button" @click="refreshDemo" data-testid="refresh-demo"><span aria-hidden="true">↻</span> 刷新演示</button></div></div>
+        <div class="map-topbar"><div class="workshop-label"><span class="workshop-icon" aria-hidden="true">▤</span><div><strong>{{ workshop.title }}</strong><span>{{ workshop.poolCount }} 池 · {{ snapshot.devices.length }} 台检测机 · 图纸第 {{ workshop.drawingPage }} / 5 页</span></div></div><div class="map-actions"><button type="button" class="quiet-button" @click="resetView" data-testid="reset-view">回到总览</button><button type="button" class="quiet-button" :disabled="loading" @click="refreshSnapshot" data-testid="refresh-snapshot"><span aria-hidden="true">↻</span> {{ loading ? "刷新中…" : "刷新数据" }}</button></div></div>
         <div class="map-controls"><div class="metric-tabs" aria-label="池内显示项目"><button type="button" :class="{ active: mapMetric === 'status' }" :aria-pressed="mapMetric === 'status'" @click="setMapMetric('status')">综合状态</button><button v-for="metric in METRICS" :key="metric.key" type="button" :class="{ active: mapMetric === metric.key }" :aria-pressed="mapMetric === metric.key" :data-testid="'map-metric-' + metric.key" @click="setMapMetric(metric.key)">{{ metric.label }}</button></div><form class="pool-search" @submit.prevent="findPool"><input v-model="poolQuery" aria-label="查找池号" :placeholder="'池号，如 ' + searchExample" maxlength="8" autocomplete="off"/><button type="submit">定位</button></form></div>
         <p class="drawing-note" :class="{ 'needs-confirmation': workshop.id === 'abalone-first' }">{{ workshop.note }}</p>
         <div class="map-legend"><span v-for="state in states" :key="state"><i :style="{ background: statusColors[state] }"></i>{{ statusNames[state] }}</span><span class="legend-selection"><i></i>当前选中</span></div>
@@ -207,17 +252,26 @@ onUnmounted(() => clearInterval(clockTimer));
 
       <ItemWrap class="panel history-panel" title="水质变化趋势">
         <div class="history-heading"><span>{{ selectedPool.id }}<b :style="{ color: selectedMetricDefinition.color }">{{ selectedMetricDefinition.label }}</b></span><div class="segmented"><button v-for="hours in [6, 24, 72]" :key="hours" type="button" :aria-pressed="historyHours === hours" :class="{ active: historyHours === hours }" @click="historyHours = hours">{{ hours }}h</button></div></div>
-        <div class="history-content"><HistoryChart :pool="selectedPool" :metric-key="activeMetric" :hours="historyHours" :now="now" /></div>
-        <div class="history-footnote"><span><i :style="{ background: selectedMetricDefinition.color }"></i>{{ selectedMetricDefinition.label }}<template v-if="selectedMetricDefinition.unit"> / {{ selectedMetricDefinition.unit }}</template></span><span>模拟历史 · 缺测保留断点</span></div>
+        <div class="history-content"><HistoryChart :pool="selectedPool" :metric-key="activeMetric" :hours="historyHours" :now="now" :refresh-key="lastLoadedAt ?? undefined" /></div>
+        <div class="history-footnote"><span><i :style="{ background: selectedMetricDefinition.color }"></i>{{ selectedMetricDefinition.label }}<template v-if="selectedMetricDefinition.unit"> / {{ selectedMetricDefinition.unit }}</template></span><span>{{ DATA_SOURCE === "demo" ? "模拟历史" : "接口历史" }} · 缺测保留断点</span></div>
         <p class="threshold-notice">阈值与单位为演示配置，需按现场要求确认。</p>
       </ItemWrap>
     </aside>
+  </div>
+  <div v-else class="snapshot-placeholder" data-testid="snapshot-empty">
+    <strong>{{ loading ? '正在加载 ' + workshop.shortName : '车间数据暂不可用' }}</strong>
+    <span>{{ loading ? '请稍候' : '请检查后端服务与接口配置后重试' }}</span>
   </div>
   </div>
 </template>
 
 <style scoped>
 .dashboard-page { display: flex; flex-direction: column; gap: 16px; height: 100%; min-height: 0; }
+.data-status { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: 24px; color: #8aadc4; font-size: 11px; line-height: 1.6; flex-shrink: 0; }
+.data-error { color: #efbe76; background: #d79a2510; border: 1px solid #ffb65d40; padding: 8px 12px; border-radius: 4px; }
+.snapshot-placeholder { display: flex; flex: 1; min-height: 280px; flex-direction: column; align-items: center; justify-content: center; gap: 16px; color: #8aadc4; border: 1px solid #23455f; background: #0b1c2f; }
+.snapshot-placeholder strong { font-size: 18px; font-weight: 500; }
+button:disabled { cursor: wait; opacity: .6; }
 .workshop-nav { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 10px; flex-shrink: 0; }
 .workshop-nav button { display: flex; align-items: center; gap: 10px; padding: 12px 14px; min-width: 0; text-align: left; border: 1px solid #23455f; border-radius: 5px; background: #0b1c2f; color: #8faec5; }
 .workshop-nav button.active { background: #12344b; border-color: #3a9ac2; color: #dbf4ff; box-shadow: inset 0 2px #42c7e6; }

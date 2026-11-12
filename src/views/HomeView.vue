@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { RouterView } from "vue-router";
 import Headers from "./header.vue";
+import { DATA_SOURCE } from "@/features/aquaculture/api";
 </script>
 
 <template>
@@ -9,7 +10,7 @@ import Headers from "./header.vue";
     <main class="app-main"><RouterView /></main>
     <footer class="app-footer">
       <span>水质监测 · 池位定位 · 设备联动</span>
-      <span>演示环境 · 未接入现场设备</span>
+      <span>{{ DATA_SOURCE === "demo" ? "演示环境 · 未接入现场设备" : "接口模式 · 数据由后端提供" }}</span>
     </footer>
   </div>
 </template>

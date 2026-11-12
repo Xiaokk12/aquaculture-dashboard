@@ -1,6 +1,6 @@
 
 import type { UserConfig, ConfigEnv } from 'vite';
-import { defineConfig } from 'vite'
+import { defineConfig, loadEnv } from 'vite'
 import vue from '@vitejs/plugin-vue'
 import { resolve } from "path";
 import AutoImport from 'unplugin-auto-import/vite'
@@ -8,10 +8,9 @@ import Components from 'unplugin-vue-components/vite'
 import { ElementPlusResolver } from 'unplugin-vue-components/resolvers'
 //https://github.com/element-plus/unplugin-element-plus/blob/HEAD/README.zh-CN.md
 import ElementPlus from 'unplugin-element-plus/vite'
-export default defineConfig(({ command, mode }: ConfigEnv): UserConfig => {
+export default defineConfig(({ mode }: ConfigEnv): UserConfig => {
 
-  // const env = loadEnv(mode, process.cwd(), '')
-  console.log(command, mode);
+  const env = loadEnv(mode, process.cwd(), '');
   return {
     plugins: [vue(),
     AutoImport({
@@ -24,6 +23,8 @@ export default defineConfig(({ command, mode }: ConfigEnv): UserConfig => {
       // useSource: true
     })
     ],
+    // preview 只核对静态构建；生产环境由 Nginx 提供 /api 转发。
+    preview: { proxy: {} },
     publicDir: "public",
     base: "./",
     server: {
@@ -31,7 +32,12 @@ export default defineConfig(({ command, mode }: ConfigEnv): UserConfig => {
       port: 8112,
       open: false,
       strictPort: false,
-      // proxy: {}
+      proxy: {
+        '/api': {
+          target: env.API_PROXY_TARGET || 'http://localhost:8080',
+          changeOrigin: true,
+        },
+      },
     },
     resolve: {
       alias: {
