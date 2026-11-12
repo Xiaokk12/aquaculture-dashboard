@@ -8,9 +8,8 @@ import '@/assets/css/main.scss'
 import '@/assets/css/tailwind.css'
 
 import {registerEcharts} from "@/plugins/echarts"
-//不使用mock 请注释掉
-import { mockXHR } from "@/mock/index";
-mockXHR()
+// Aquaculture preview data is provided by its own data module.
+// Leave the template's global XHR mock disabled for future device integration.
 
 const app = createApp(App)
 registerEcharts(app)
